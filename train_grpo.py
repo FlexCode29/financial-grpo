@@ -7,6 +7,7 @@ from huggingface_hub import login
 
 from src.data_loader import load_financial_dataset
 from src.reward import financial_reward_function
+from src.callbacks import PeriodicEvalCallback
 
 FINANCIAL_SYSTEM_PROMPT = """You are an expert financial analyst AI. Your task is to predict future stock performance based on 20 years of financial data.
 Respond in the following XML format, providing your reasoning first, followed by the answer.
@@ -23,44 +24,43 @@ Respond in the following XML format, providing your reasoning first, followed by
 
 
 def main(args):
-    """Main function to orchestrate the GRPO training process."""
     hf_token = os.environ.get("HF_TOKEN")
-    if hf_token:
-        print("HF_TOKEN found, logging in.")
-        login(token=hf_token)
-
+    if hf_token: login(token=hf_token)
     if args.report_to == 'wandb':
         import wandb
         wandb.init(project=args.wandb_project, config=args)
     
-    if torch.cuda.is_available():
-        print("CUDA is available! Using GPU.")
-        dtype, load_in_4bit = torch.bfloat16, True
+    use_gpu = torch.cuda.is_available()
+    if use_gpu:
+        print("ROCm-enabled GPU detected. Using GPU for training.")
+        dtype, load_in_4bit, bf16_enabled = torch.bfloat16, True, True
     else:
-        print("CUDA not available. Running on CPU for smoke test.")
-        dtype, load_in_4bit = torch.float32, False
+        print("!!! WARNING: No compatible GPU detected. Falling back to CPU for smoke test. !!!")
+        dtype, load_in_4bit, bf16_enabled = torch.float32, False, False
     
-    print(f"Loading base model: {args.model_name}")
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=args.model_name,
-        max_seq_length=args.max_seq_length,
-        dtype=dtype,
-        load_in_4bit=load_in_4bit,
-        token=hf_token,
-        fast_inference=True,
+        model_name=args.model_name, max_seq_length=args.max_seq_length,
+        dtype=dtype, load_in_4bit=load_in_4bit, token=hf_token, fast_inference=True,
     )
-
     model = FastLanguageModel.get_peft_model(
-        model,
-        r=args.lora_rank,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        lora_alpha=args.lora_rank,
-        use_gradient_checkpointing="unsloth",
-        random_state=42,
+        model, r=args.lora_rank, target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_alpha=args.lora_rank, use_gradient_checkpointing="unsloth", random_state=42
     )
     print("LoRA adapters added to the model.")
 
-    train_dataset = load_financial_dataset(split='train')
+    print("Loading datasets for training and periodic evaluation...")
+    train_dataset = load_financial_dataset(
+        split='train',
+        test_size=args.test_split_size,
+        k_folds=args.k_folds,
+        fold_index=args.fold_index
+    )
+    eval_dataset = load_financial_dataset(
+        split='test',
+        test_size=args.test_split_size,
+        k_folds=args.k_folds,
+        fold_index=args.fold_index
+    )
 
     def format_prompt(examples):
         prompts = []
@@ -84,8 +84,14 @@ def main(args):
         learning_rate=args.learning_rate, lr_scheduler_type="cosine", max_steps=args.max_steps,
         save_strategy="steps", save_steps=100, logging_steps=1,
         report_to=args.report_to, remove_unused_columns=False,
-        warmup_steps=5, optim="adamw_8bit", bf16=torch.cuda.is_available(),
+        warmup_steps=20, optim="adamw_8bit", bf16=torch.cuda.is_available(),
         use_vllm=True,
+    )
+
+    periodic_eval_callback = PeriodicEvalCallback(
+        tokenizer=tokenizer,
+        eval_dataset=eval_dataset,
+        eval_steps=args.eval_steps
     )
 
     grpo_trainer = GRPOTrainer(
@@ -93,6 +99,7 @@ def main(args):
         train_dataset=train_dataset,
         reward_funcs=[financial_reward_function],
         tokenizer=tokenizer,
+        callbacks=[PeriodicEvalCallback(tokenizer, eval_dataset)] # Pass the callback
     )
 
     print("\n--- Starting GRPO Training (with vLLM acceleration) ---")
@@ -105,6 +112,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run GRPO training for financial prediction.")
+    parser.add_argument("--eval_steps", type=int, default=100, help="Run evaluation every N steps.")
     parser.add_argument("--model_name", type=str, default="unsloth/Qwen2-1.5B-Instruct-GGUF", help="Base model.")
     parser.add_argument("--output_dir", type=str, default="outputs", help="Directory for final adapters.")
     parser.add_argument("--max_seq_length", type=int, default=2048)
@@ -114,6 +122,9 @@ if __name__ == "__main__":
     parser.add_argument("--max_completion_length", type=int, default=512)
     parser.add_argument("--per_device_train_batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument("--test_split_size", type=float, default=0.2, help="Fraction of data for testing (used if k_folds=1).")
+    parser.add_argument("--k_folds", type=int, default=1, help="Number of folds for cross-validation.")
+    parser.add_argument("--fold_index", type=int, default=0, help="The current fold index to run (0-based).")
     parser.add_argument("--learning_rate", type=float, default=5e-6)
     parser.add_argument("--max_steps", type=int, default=250)
     parser.add_argument("--report_to", type=str, default="wandb", choices=["wandb", "none"])

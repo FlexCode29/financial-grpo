@@ -4,16 +4,14 @@ import torch
 import pandas as pd
 import numpy as np
 from unsloth import FastLanguageModel
-from sklearn.metrics import mean_squared_error, accuracy_score
+from sklearn.metrics import mean_squared_error, accuracy_score, f1_score, r2_score
 from datasets import load_dataset
 
-# === The Critical Connections ===
 from src.data_loader import load_financial_dataset
 from src.reward import _parse_prediction
 from train_grpo import FINANCIAL_SYSTEM_PROMPT
-# ==============================
 
-# --- Mappings for Metric Calculation ---
+# Metric classification mappings
 BAND_TO_INT_MAPPING = {"returns": {"bad": 0, "neutral": 1, "good": 2}, "volatility": {"low": 0, "medium": 1, "high": 2}}
 
 # --- Assumptions for VaR/CVaR Calculation ---
@@ -95,7 +93,12 @@ def main(args):
 
     # --- 2. Evaluate on our custom GRPO task ---
     print("\n--- Evaluating on Custom GRPO Task ---")
-    test_dataset = load_financial_dataset(split='test', test_size=args.test_split_size)
+    test_dataset = load_financial_dataset(
+        split='test',
+        test_size=args.test_split_size,
+        k_folds=args.k_folds,
+        fold_index=args.fold_index
+    )
     results = []
     for example in test_dataset:
         if not example['is_grpo_task']: continue
@@ -120,6 +123,9 @@ def main(args):
         metrics[f"accuracy_{band_type}_1y"] = accuracy_score(eval_df[gt_col], eval_df[pred_col])
         gt_int, pred_int = eval_df[gt_col].map(BAND_TO_INT_MAPPING[band_type]), eval_df[pred_col].map(BAND_TO_INT_MAPPING[band_type])
         metrics[f"mse_{band_type}_1y"] = mean_squared_error(gt_int, pred_int)
+
+        metrics[f"f1_weighted_{band_type}_1y"] = f1_score(eval_df[gt_col], eval_df[pred_col], average='weighted')
+        metrics[f"r2_score_{band_type}_1y"] = r2_score(gt_int, pred_int)
     
     # Calculate VaR/CVaR from the predicted return bands
     valid_return_preds = results_df['pred_ret_1y'].dropna().tolist()
@@ -144,6 +150,8 @@ if __name__ == "__main__":
     parser.add_argument("--model_path", type=str, required=True, help="Path to the saved LoRA adapters.")
     parser.add_argument("--base_model", type=str, default="unsloth/Qwen2-1.5B-Instruct-GGUF", help="Base model.")
     parser.add_argument("--test_split_size", type=float, default=0.2)
+    parser.add_argument("--k_folds", type=int, default=1, help="Number of folds for cross-validation.")
+    parser.add_argument("--fold_index", type=int, default=0, help="The current fold index to run (0-based).")
     parser.add_argument("--report_to", type=str, default="wandb", choices=["wandb", "none"])
     parser.add_argument("--wandb_project", type=str, default="financial-grpo-llm")
     parser.add_argument("--run_name", type=str, default="unnamed-run")

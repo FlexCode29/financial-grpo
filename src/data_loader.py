@@ -1,5 +1,7 @@
 import pandas as pd
-from datasets import Dataset, load_dataset, concatenate_datasets
+from datasets import Dataset, load_dataset
+from sklearn.model_selection import KFold
+import numpy as np
 
 # Define the repository names and the correct, verified file names.
 FINANCIAL_REPO = "elliotgao10/financial_statements"
@@ -101,7 +103,7 @@ def _process_fincot_data(fincot_ds):
         processed_data.append({"prompt": prompt, "is_grpo_task": False})
     return pd.DataFrame(processed_data)
 
-def load_financial_dataset(split='train', test_size=0.2):
+def load_financial_dataset(split='train', test_size=0.2, k_folds=1, fold_index=0):
     """Loads and combines all necessary datasets for mixed-task training."""
     print("--- Loading All Datasets Individually ---")
     dataframes = {}
@@ -121,9 +123,25 @@ def load_financial_dataset(split='train', test_size=0.2):
     final_dataset = Dataset.from_pandas(combined_df).shuffle(seed=42)
 
     print(f"--- All datasets loaded and combined. Total examples: {len(final_dataset)} ---")
-    
-    split_dataset = final_dataset.train_test_split(test_size=test_size, seed=42)
-    return split_dataset[split]
+
+    if k_folds > 1:
+        print(f"Creating {k_folds}-fold cross-validation splits. Using fold {fold_index}")
+        kf = KFold(n_splits=k_folds, shuffle=True, random_state=42)
+
+        all_splits = list(kf.split(final_dataset))
+        train_idxs, test_idxs = all_splits[fold_index]
+
+        train_dataset = final_dataset.select(train_idxs)
+        test_dataset = final_dataset.select(test_idxs)
+
+        if split == 'train':
+            return train_dataset
+        else: # split == 'test'
+            return test_dataset
+
+    else:
+        split_dataset = final_dataset.train_test_split(test_size=test_size, seed=42)
+        return split_dataset[split]
 
 # --- VERIFICATION BLOCK ---
 if __name__ == '__main__':
