@@ -40,7 +40,7 @@ def main(args):
     
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=args.model_name, max_seq_length=args.max_seq_length,
-        dtype=dtype, load_in_4bit=load_in_4bit, token=hf_token, fast_inference=True,
+        dtype=dtype, load_in_4bit=load_in_4bit, token=hf_token, fast_inference=False,
     )
     model = FastLanguageModel.get_peft_model(
         model, r=args.lora_rank, target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
@@ -85,7 +85,7 @@ def main(args):
         save_strategy="steps", save_steps=100, logging_steps=1,
         report_to=args.report_to, remove_unused_columns=False,
         warmup_steps=20, optim="adamw_8bit", bf16=torch.cuda.is_available(),
-        use_vllm=True,
+        use_vllm=False,
     )
 
     periodic_eval_callback = PeriodicEvalCallback(

@@ -5,7 +5,19 @@ from sklearn.metrics import accuracy_score
 import wandb # Import wandb to log metrics
 
 from src.reward import _parse_prediction
-from train_grpo import FINANCIAL_SYSTEM_PROMPT
+#from train_grpo import FINANCIAL_SYSTEM_PROMPT
+FINANCIAL_SYSTEM_PROMPT = """You are an expert financial analyst AI. Your task is to predict future stock performance based on 20 years of financial data.
+Respond in the following XML format, providing your reasoning first, followed by the answer.
+
+<reasoning>
+[Your detailed analysis and reasoning for the predictions goes here.]
+</reasoning>
+<answer>
+<returns_1y>[bad/neutral/good]</returns_1y>
+<volatility_1y>[low/medium/high]</volatility_1y>
+<returns_5y>[bad/neutral/good]</returns_5y>
+<volatility_5y>[low/medium/high]</volatility_5y>
+</answer>"""
 
 class PeriodicEvalCallback(TrainerCallback):
     def __init__(self, tokenizer, eval_dataset, eval_steps=100, num_samples=32):

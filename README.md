@@ -20,6 +20,14 @@ The pipeline is built to be scalable and efficient, leveraging high-performance 
 
 ## 2. Prerequisites
 
+Log in: 
+
+sudo docker run   --rm -it   --device=/dev/kfd   --device=/dev/dri   --ipc=host   --shm-size=16g   --env-file ./.env.local   --entrypoint /bin/bash   financial-grpo
+
+Install torch first:
+
+/opt/conda/bin/python -m pip install --no-cache-dir --pre torch torchvision  --index-url https://download.pytorch.org/whl/nightly/rocm6.2/
+
 This pipeline is designed for a specific hardware and software environment. Before you begin, ensure you have the following:
 
 1.  **A Linux Host Machine:** The Docker container must be run on a Linux OS. It will not work on a Windows or macOS host due to driver limitations.
