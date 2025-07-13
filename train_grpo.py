@@ -33,7 +33,7 @@ def main(args):
     use_gpu = torch.cuda.is_available()
     if use_gpu:
         print("ROCm-enabled GPU detected. Using GPU for training.")
-        dtype, load_in_4bit, bf16_enabled = torch.bfloat16, True, True
+        dtype, load_in_4bit, bf16_enabled = torch.bfloat16, False, True
     else:
         print("!!! WARNING: No compatible GPU detected. Falling back to CPU for smoke test. !!!")
         dtype, load_in_4bit, bf16_enabled = torch.float32, False, False
@@ -42,6 +42,23 @@ def main(args):
         model_name=args.model_name, max_seq_length=args.max_seq_length,
         dtype=dtype, load_in_4bit=load_in_4bit, token=hf_token, fast_inference=False,
     )
+    if tokenizer.chat_template is None:          # ← only patch once
+        tokenizer.chat_template = """
+        {% for m in messages %}
+        {{ '<|begin_of_text|>' if loop.first }}
+        {% if m['role'] == 'system' -%}
+        <|start_header_id|>system<|end_header_id|>
+        {{ m['content'] }}<|eot_id|>
+        {% elif m['role'] == 'user' -%}
+        <|start_header_id|>user<|end_header_id|>
+        {{ m['content'] }}<|eot_id|>
+        {% elif m['role'] == 'assistant' -%}
+        <|start_header_id|>assistant<|end_header_id|>
+        {{ m['content'] }}<|eot_id|>
+        {% endif %}{% endfor %}
+        {% if add_generation_prompt -%}
+        <|start_header_id|>assistant<|end_header_id|>
+        {% endif -%}""".strip()
     model = FastLanguageModel.get_peft_model(
         model, r=args.lora_rank, target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         lora_alpha=args.lora_rank, use_gradient_checkpointing="unsloth", random_state=42
@@ -84,7 +101,7 @@ def main(args):
         learning_rate=args.learning_rate, lr_scheduler_type="cosine", max_steps=args.max_steps,
         save_strategy="steps", save_steps=100, logging_steps=1,
         report_to=args.report_to, remove_unused_columns=False,
-        warmup_steps=20, optim="adamw_8bit", bf16=torch.cuda.is_available(),
+        warmup_steps=20, optim="paged_adamw_8bit", bf16=torch.cuda.is_available(),
         use_vllm=False,
     )
 
