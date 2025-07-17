@@ -101,7 +101,7 @@ def main(args):
         learning_rate=args.learning_rate, lr_scheduler_type="cosine", max_steps=args.max_steps,
         save_strategy="steps", save_steps=100, logging_steps=1,
         report_to=args.report_to, remove_unused_columns=False,
-        warmup_steps=20, optim="paged_adamw_8bit", bf16=torch.cuda.is_available(),
+        warmup_steps=20, optim="adamw_torch", bf16=torch.cuda.is_available(),
         use_vllm=False,
     )
 
@@ -116,7 +116,7 @@ def main(args):
         train_dataset=train_dataset,
         reward_funcs=[financial_reward_function],
         tokenizer=tokenizer,
-        callbacks=[PeriodicEvalCallback(tokenizer, eval_dataset)] # Pass the callback
+        callbacks=[periodic_eval_callback] # Pass the callback in a list
     )
 
     print("\n--- Starting GRPO Training (with vLLM acceleration) ---")
