@@ -1,126 +1,93 @@
-#!/bin/bash
+#!/usr/bin/env bash
+###############################################################################
+# run.sh — Accelerate‑based wrapper for GRPO fine‑tuning with Unsloth
+#
+# Usage
+#   ./run.sh <model_name_or_path> [hf_repo_id] [MODE]
+#     model_name_or_path  (required)  local dir or HF repo slug
+#     hf_repo_id          (optional)  target repo for FINAL_TRAIN push
+#     MODE                (optional)  CV | FINAL_TRAIN    (default: CV)
+#
+# Environment
+#   export HF_TOKEN and WANDB_API_KEY  (or put them in .env.local).
+#   accelerate config   # run once; choose LOCAL_MACHINE, bf16, 1 process.
+###############################################################################
+set -euo pipefail
+[[ -f ".env.local" ]] && source ".env.local"
 
-MODE="CV"
+MODEL_NAME="${1:-}"
+HF_REPO_ID="${2:-}"
+MODE="${3:-CV}"
 
-MODEL_NAME=${1}
-HF_REPO_ID=${2}
+if [[ -z "$MODEL_NAME" ]]; then
+  echo "USAGE: ./run.sh <model_name_or_path> [hf_repo_id] [MODE]"
+  exit 1
+fi
+if [[ "$MODE" == "FINAL_TRAIN" && -z "$HF_REPO_ID" ]]; then
+  echo "FINAL_TRAIN selected but no HF repo id supplied."
+  exit 1
+fi
+: "${HF_TOKEN?Need HF_TOKEN}"  : "${WANDB_API_KEY?Need WANDB_API_KEY}"
 
-# --- CROSS-VALIDATION PARAMETERS (used in CV mode) ---
+# -------- ROCm fragmentation help -------------------------------------------
+export PYTORCH_HIP_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128
+
+# -------- hyper‑parameters ---------------------------------------------------
 K_FOLDS=5
-
-# --- KEY TRAINING HYPERPARAMETERS (Tunable) ---
-MAX_STEPS=500
-LEARNING_RATE=5e-6
+MAX_STEPS=800
+LEARNING_RATE=8e-6
 LORA_RANK=16
-NUM_GENERATIONS=4
+NUM_GENERATIONS=2
 PER_DEVICE_BATCH_SIZE=1
-GRADIENT_ACCUMULATION_STEPS=4
+GRAD_ACC_STEPS=4
+MAX_PROMPT=4096
+MAX_COMP=512
+WANDB_PROJECT="deepseek-r1-70b-grpo"
 
-# --- LOGGING PARAMETERS ---
-WANDB_PROJECT="financial-grpo-llm"
+TRAIN_SCRIPT="train_grpo.py"
 
-# =================================================================
-# ======================== END OF CONFIG ========================
-# =================================================================
+launch() {
+  accelerate launch --num_processes 1 "$TRAIN_SCRIPT" \
+    --model_name "$MODEL_NAME"             \
+    --output_dir "$OUTPUT_DIR"             \
+    --learning_rate "$LEARNING_RATE"       \
+    --max_steps "$MAX_STEPS"               \
+    --lora_rank "$LORA_RANK"               \
+    --num_generations "$NUM_GENERATIONS"   \
+    --per_device_train_batch_size "$PER_DEVICE_BATCH_SIZE" \
+    --gradient_accumulation_steps "$GRAD_ACC_STEPS"        \
+    --max_prompt_length "$MAX_PROMPT"      \
+    --max_completion_length "$MAX_COMP"    \
+    --device_map balanced                  \
+    --report_to wandb                      \
+    --wandb_project "$WANDB_PROJECT"       \
+    "$@"
+}
 
-# --- Sanity Checks ---
-if [ -z "$MODEL_NAME" ]; then
-    echo "Error: You must provide a model name as the first argument."
-    echo "Usage: ./run.sh <model_name> [hf_repo_id]"
-    exit 1
-fi
-if [ "$MODE" = "FINAL_TRAIN" ] && [ -z "$HF_REPO_ID" ]; then
-    echo "Error: MODE is FINAL_TRAIN, but no Hugging Face repo ID was provided as the second argument."
-    exit 1
-fi
-if [ -z "$WANDB_API_KEY" ] || [ -z "$HF_TOKEN" ]; then
-    echo "Error: WANDB_API_KEY and/or HF_TOKEN not found in .env.local file."
-    exit 1
-fi
+# -------- main logic ---------------------------------------------------------
+if [[ "$MODE" == "CV" ]]; then
+  for FOLD in $(seq 0 $((K_FOLDS-1))); do
+    OUTPUT_DIR="./outputs/cv_fold_${FOLD}"
+    launch --k_folds "$K_FOLDS" --fold_index "$FOLD"
 
-# --- Main Logic ---
-if [ "$MODE" = "CV" ]; then
-    # --- WORKFLOW 1: K-Fold Cross-Validation ---
-    echo "--- Starting K-Fold Cross-Validation ---"
-    echo "Model: $MODEL_NAME, Folds: $K_FOLDS"
-    echo "----------------------------------------"
-
-    for i in $(seq 0 $((K_FOLDS - 1))); do
-        FOLD_INDEX=$i
-        OUTPUT_DIR="/app/outputs/cv_fold_${FOLD_INDEX}"
-        echo -e "\n\n=============== RUNNING FOLD ${FOLD_INDEX} ================"
-        
-        # 1. Train on the current fold
-        echo "--- Training Fold ${FOLD_INDEX} ---"
-        accelerate launch train_grpo.py \
-            --model_name "$MODEL_NAME" \
-            --output_dir "$OUTPUT_DIR" \
-            --learning_rate $LEARNING_RATE \
-            --max_steps $MAX_STEPS \
-            --lora_rank $LORA_RANK \
-            --num_generations $NUM_GENERATIONS \
-            --per_device_train_batch_size $PER_DEVICE_BATCH_SIZE \
-            --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS \
-            --k_folds $K_FOLDS \
-            --fold_index $FOLD_INDEX \
-            --report_to "wandb" \
-            --wandb_project "$WANDB_PROJECT"
-
-        # 2. Evaluate on the current fold's test set
-        echo "--- Evaluating Fold ${FOLD_INDEX} ---"
-        python evaluate.py \
-            --model_path "$OUTPUT_DIR" \
-            --base_model "$MODEL_NAME" \
-            --k_folds $K_FOLDS \
-            --fold_index $FOLD_INDEX \
-            --report_to "wandb" \
-            --wandb_project "$WANDB_PROJECT" \
-            --run_name "eval_fold_${FOLD_INDEX}_of_${K_FOLDS}"
-    done
-
-    # 3. Aggregate all results
-    echo -e "\n\n--- Aggregating All Cross-Validation Results ---"
-    python aggregate_results.py \
-        --base_dir "/app/outputs" \
-        --k_folds $K_FOLDS
-
-elif [ "$MODE" = "FINAL_TRAIN" ]; then
-    # --- WORKFLOW 2: Final Training and Hugging Face Upload ---
-    echo "--- Starting Final Training Run for Hugging Face Upload ---"
-    echo "Model: $MODEL_NAME, Repo: $HF_REPO_ID"
-    echo "----------------------------------------------------------"
-    
-    OUTPUT_DIR="/app/outputs/final_model"
-
-    # Train on the full dataset (k_folds=1 uses the default train/test split)
-    accelerate launch train_grpo.py \
-        --model_name "$MODEL_NAME" \
-        --output_dir "$OUTPUT_DIR" \
-        --learning_rate $LEARNING_RATE \
-        --max_steps $MAX_STEPS \
-        --lora_rank $LORA_RANK \
-        --num_generations $NUM_GENERATIONS \
-        --per_device_train_batch_size $PER_DEVICE_BATCH_SIZE \
-        --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS \
-        --k_folds 1 \
-        --report_to "wandb" \
-        --wandb_project "$WANDB_PROJECT" \
-        --push_to_hub \
-        --hf_repo_id "$HF_REPO_ID"
-
-    # Optionally, run a final evaluation on the held-out test set
-    echo "--- Evaluating Final Model ---"
     python evaluate.py \
-        --model_path "$OUTPUT_DIR" \
-        --base_model "$MODEL_NAME" \
-        --k_folds 1 \
-        --report_to "wandb" \
-        --wandb_project "$WANDB_PROJECT" \
-        --run_name "final_model_eval"
+      --model_path "$OUTPUT_DIR" --base_model "$MODEL_NAME" \
+      --k_folds "$K_FOLDS" --fold_index "$FOLD"             \
+      --report_to wandb --wandb_project "$WANDB_PROJECT" \
+      --run_name "eval_fold_${FOLD}_of_${K_FOLDS}"
+  done
+  python aggregate_results.py --base_dir "./outputs" --k_folds "$K_FOLDS"
 
+elif [[ "$MODE" == "FINAL_TRAIN" ]]; then
+  OUTPUT_DIR="./outputs/final_model"
+  launch --k_folds 1 --push_to_hub --hf_repo_id "$HF_REPO_ID"
+
+  python evaluate.py \
+    --model_path "$OUTPUT_DIR" --base_model "$MODEL_NAME" \
+    --k_folds 1 --report_to wandb --wandb_project "$WANDB_PROJECT" \
+    --run_name "final_model_eval"
 else
-    echo "Error: Invalid MODE set. Choose 'CV' or 'FINAL_TRAIN'."
-    exit 1
+  echo "MODE must be CV or FINAL_TRAIN"; exit 1
 fi
 
-echo "--- Script Finished ---"
+echo "==== run.sh finished OK ===="
