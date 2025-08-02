@@ -1,4 +1,4 @@
-FROM rocm/vllm-dev:main
+FROM rocm/vllm:rocm6.3.1_vllm_0.8.5_20250513
 
 WORKDIR /app
 
@@ -35,6 +35,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 RUN pip install trl==0.16.1
+
+RUN pip install deepspeed==0.16.4
 
 COPY . .
 
