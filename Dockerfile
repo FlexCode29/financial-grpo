@@ -34,6 +34,8 @@ COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
+RUN pip install trl==0.16.1
+
 COPY . .
 
 RUN chmod +x run.sh

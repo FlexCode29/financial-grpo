@@ -1,14 +1,22 @@
 """
-Multi‑GPU GRPO fine‑tuning for DeepSeek‑R1‑Distill‑Llama‑70B with Unsloth + LoRA
-Save this file as train.py, then run one of:
+Multi-GPU GRPO fine-tuning on ROCm with optional vLLM off-loading
+===============================================================
 
-  accelerate launch train.py
-  torchrun --nproc_per_node 8 train.py                 # 8 MI250X packages
-  torchrun --nproc_per_node 16 train.py                # 16 logical ROCm devices
+Save as train_grpo.py, then run e.g.
 
-Make sure you created an Accelerate config first:
-  accelerate config
+# terminal 1 – vLLM server on GPU 0
+HIP_VISIBLE_DEVICES=0 trl vllm-serve \
+  --model unsloth/DeepSeek-R1-Distill-Llama-70B-bnb-4bit \
+  --max-model-len 4096
+
+# terminal 2 – GRPO training on GPUs 1-7
+export HIP_VISIBLE_DEVICES=1,2,3,4,5,6,7
+accelerate launch --multi_gpu --num_processes 7 train_grpo.py \
+  --model_name unsloth/DeepSeek-R1-Distill-Llama-70B-bnb-4bit \
+  --use_vllm --vllm_device rocm:0 \
+  --report_to wandb
 """
+
 import os
 import argparse
 import torch
@@ -17,7 +25,7 @@ from huggingface_hub import login
 from unsloth import FastLanguageModel
 from trl import GRPOTrainer, GRPOConfig
 
-# project code
+# project-specific imports
 from src.data_loader import load_financial_dataset
 from src.reward import financial_reward_function
 from src.callbacks import PeriodicEvalCallback
@@ -74,21 +82,18 @@ def main(args):
         wandb.init(project=args.wandb_project, config=vars(args))
 
     # -------- model load --------
-    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-    device_map = args.device_map
+    dtype = torch.bfloat16 if (torch.cuda.is_available() or torch.backends.hip.is_available()) else torch.float32
 
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=args.model_name,
         max_seq_length=args.max_seq_length,
-        load_in_4bit=True,
+        load_in_4bit=not args.use_vllm,           # 4-bit LoRA clashes with vLLM
         dtype=dtype,
-        device_map=device_map,          # "balanced" by default
         token=os.getenv("HF_TOKEN"),
         fast_inference=False,
     )
-    
 
-    # patch chat template once
+    # add chat template once
     if tokenizer.chat_template is None:
         tokenizer.chat_template = """
 {% for m in messages -%}
@@ -99,20 +104,25 @@ def main(args):
 <|start_header_id|>assistant<|end_header_id|>
 {% endif -%}""".strip()
 
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=args.lora_rank,
-        target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
-        lora_alpha=args.lora_rank,
-        bias="none",
-        use_gradient_checkpointing="unsloth",
-        random_state=42,
-    )
-    if accelerator.is_main_process:
-        model.print_trainable_parameters()
+    # LoRA only when vLLM is off
+    if not args.use_vllm:
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=args.lora_rank,
+            target_modules=[
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ],
+            lora_alpha=args.lora_rank,
+            bias="none",
+            use_gradient_checkpointing="unsloth",
+            random_state=42,
+        )
+        if accelerator.is_main_process:
+            model.print_trainable_parameters()
+    else:
+        if accelerator.is_main_process:
+            print("vLLM mode: full-weight training (LoRA disabled)")
 
     # -------- data --------
     train_ds = load_financial_dataset(
@@ -127,7 +137,6 @@ def main(args):
         k_folds=args.k_folds,
         fold_index=args.fold_index,
     )
-
     train_ds = train_ds.map(lambda b: format_prompts(b, tokenizer), batched=True)
 
     # -------- trainer config --------
@@ -148,9 +157,10 @@ def main(args):
         remove_unused_columns=False,
         warmup_steps=args.warmup_steps,
         optim="paged_adamw_8bit",
-        bf16=torch.cuda.is_available(),
-        use_vllm=False,
-        ddp_find_unused_parameters=False,     # crucial for DDP/FSDP
+        bf16=torch.cuda.is_available() or torch.backends.hip.is_available(),
+        use_vllm=args.use_vllm,
+        vllm_device=args.vllm_device,
+        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
     )
 
     eval_cb = PeriodicEvalCallback(
@@ -169,17 +179,17 @@ def main(args):
     )
 
     if accelerator.is_main_process:
-        print("Starting training")
+        print("Starting GRPO training")
     trainer.train()
     if accelerator.is_main_process:
-        print("Training finished, saving adapters")
+        print("Training finished, saving model or adapters")
     trainer.save_model()
 
 # ---------- CLI ----------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", type=str, default="unsloth/DeepSeek-R1-Distill-Llama-70B-bnb-4bit")
-    parser.add_argument("--output_dir", type=str, default="outputs_70b_multigpu")
+    parser.add_argument("--output_dir", type=str, default="outputs_70b_grpo")
     parser.add_argument("--max_seq_length", type=int, default=2048)
     parser.add_argument("--lora_rank", type=int, default=16)
     parser.add_argument("--num_generations", type=int, default=4)
@@ -197,6 +207,9 @@ if __name__ == "__main__":
     parser.add_argument("--test_split_size", type=float, default=0.2)
     parser.add_argument("--k_folds", type=int, default=1)
     parser.add_argument("--fold_index", type=int, default=0)
-    parser.add_argument("--device_map", type=str, default="balanced", help='Use "balanced" for pipeline parallelism or "auto"')
+    parser.add_argument("--use_vllm", action="store_true", help="Enable remote vLLM generation")
+    parser.add_argument("--vllm_device", type=str, default="rocm:0", help="Device id reserved for vLLM")
+    parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.9)
     args = parser.parse_args()
+
     main(args)
