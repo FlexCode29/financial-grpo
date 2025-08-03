@@ -1,176 +1,101 @@
+# ───────────────────────────────────────────────────────────────────────────────
+#  src/data_loader.py          (replaces your previous financial loader)
+# ───────────────────────────────────────────────────────────────────────────────
+"""
+Utility for loading and preparing the theeseus-ai/RiskClassifier dataset.
+
+Each example is turned into a single prompt that concatenates the scenario
+`context` and `query`, and provides the four multiple-choice answers so that the
+model can reason step-by-step before selecting one of the risk-level bands:
+    • low risk
+    • moderate risk
+    • high risk
+    • very high risk
+The ground-truth label is stored in column `ground_truth_risk_band`.
+"""
+
+from __future__ import annotations
+import random
+from typing import List, Dict
+
 import pandas as pd
-from datasets import Dataset, load_dataset
+from datasets import load_dataset, Dataset
 from sklearn.model_selection import KFold
-import numpy as np
 
-# Define the repository names and the correct, verified file names.
-FINANCIAL_REPO = "elliotgao10/financial_statements"
-FINANCIAL_FILES = {
-    "companies": "company.csv",
-    "income": "unified_income_statement_20250701_113211.csv",
-    "balance": "unified_balance_sheet_20250701_113211.csv",
-    "cash_flow": "unified_cash_flow_20250701_113211.csv",
-    "insider": "enhanced_insider_transactions_20250701_115019.csv",
-    "news": "enhanced_news_sentiment_20250701_115019.csv",
-    "transcripts": "real_earnings_transcripts_20250701_120139.csv",
-}
+# ---------------------------------------------------------------------------
+#  Dataset constants
+# ---------------------------------------------------------------------------
+RISK_DATASET_REPO = "theeseus-ai/RiskClassifier"
+ORDERED_BANDS: List[str] = ["low risk", "moderate risk",
+                            "high risk", "very high risk"]
 
+def _score_to_band(score: int) -> str:
+    """
+    Maps the numeric `risk_score` (0-100) onto one of the four bands.
+      0-24   → low risk
+      25-49  → moderate risk
+      50-74  → high risk
+      75-100 → very high risk
+    """
+    if score < 25:
+        return "low risk"
+    if score < 50:
+        return "moderate risk"
+    if score < 75:
+        return "high risk"
+    return "very high risk"
 
-def _summarize_supplementary_data(ticker: str, news_df: pd.DataFrame, insider_df: pd.DataFrame, transcripts_df: pd.DataFrame) -> str:
-    """Create a brief text summary of news, insider transactions and earnings transcripts."""
-    summaries = []
-
-    # News sentiment
-    company_news = news_df[news_df["symbol"] == ticker]
-    if not company_news.empty:
-        latest_news = company_news.sort_values(by="time_published", ascending=False).iloc[0]
-        summaries.append(
-            f"Recent News Sentiment: {latest_news['overall_sentiment_label']} (Score: {latest_news['overall_sentiment_score']:.2f})"
-        )
-    else:
-        summaries.append("Recent News Sentiment: No data available.")
-
-    # Insider activity
-    company_insider = insider_df[insider_df["symbol"] == ticker]
-    if not company_insider.empty and company_insider["data_available"].iloc[0]:
-        summaries.append("Recent Insider Activity: Data is available.")
-    else:
-        summaries.append("Recent Insider Activity: No data available.")
-
-    # Earnings transcripts
-    company_transcripts = transcripts_df[transcripts_df["symbol"] == ticker]
-    if not company_transcripts.empty:
-        latest_transcript = company_transcripts.sort_values(by="quarter", ascending=False).iloc[0]
-        summaries.append(
-            f"Latest Earnings Transcript (Q{latest_transcript['quarter']}): {latest_transcript['title']}"
-        )
-    else:
-        summaries.append("Latest Earnings Transcript: No data available.")
-
-    return "\n".join(summaries)
-
-
-def _process_financial_statements(dataframes: dict) -> pd.DataFrame:
-    """Merge and process the various financial dataframes and output one row per fiscal year."""
-    # Harmonise company names and tickers
-    companies_df = dataframes["companies"].rename(columns={"Ticker": "symbol", "Company": "company"})
-
-    # Merge financial statement components
-    merge_keys = ["symbol", "fiscalDateEnding"]
-    financial_df = pd.merge(
-        dataframes["income"],
-        dataframes["balance"],
-        on=merge_keys,
-        how="outer",
-        suffixes=("_inc", "_bal"),
+def _build_prompt(row: Dict) -> str:
+    """
+    Formats a single example into a text prompt.
+    """
+    answers = ", ".join(row["answers"])
+    return (
+        f"{row['context']}\n\n"
+        f"Question: {row['query']}\n"
+        f"Options: {answers}\n"
+        f"Select the most appropriate risk level."
     )
-    financial_df = pd.merge(financial_df, dataframes["cash_flow"], on=merge_keys, how="outer")
 
-    # Attach company names
-    merged_df = pd.merge(companies_df, financial_df, on="symbol", how="right")
+# ---------------------------------------------------------------------------
+#  Public loader
+# ---------------------------------------------------------------------------
+def load_risk_dataset(
+    split: str = "train",
+    test_size: float = 0.2,
+    k_folds: int = 1,
+    fold_index: int = 0,
+    seed: int = 42,
+) -> Dataset:
+    """
+    Returns a 🤗 `datasets.Dataset` ready for training or evaluation.
 
-    processed_rows = []
+    Columns emitted:
+        • prompt                 (str)  – the formatted prompt
+        • ground_truth_risk_band (str)  – one of the four ordered bands
+    """
+    # 1. Load the parquet file from the hub
+    ds = load_dataset(RISK_DATASET_REPO, split="train")
 
-    for _, row in merged_df.iterrows():
-        company_name = row.get("company")
-        ticker_symbol = row["symbol"]
-        if pd.isna(company_name):
-            continue
+    # 2. Derive band label and build prompt
+    ds = ds.map(
+        lambda r: {
+            "ground_truth_risk_band": _score_to_band(int(r["risk_score"])),
+            "prompt": _build_prompt(r),
+        },
+        remove_columns=ds.column_names,
+    )
 
-        # Supplementary data text block
-        supp_summary = _summarize_supplementary_data(
-            ticker_symbol, dataframes["news"], dataframes["insider"], dataframes["transcripts"]
-        )
+    # 3. Shuffle (for determinism in CV)
+    ds = ds.shuffle(seed=seed)
 
-        # Prompt assembly for the specific year
-        prompt_lines = [
-            f"Company: {company_name} ({ticker_symbol})",
-            "Analyze the following financial snapshot and supplementary data to predict its performance.",
-            "--- Supplementary Data ---",
-            supp_summary,
-            "--- Financial Snapshot ---",
-            (
-                f"Date: {row.get('fiscalDateEnding', 'N/A')}; "
-                f"Revenue: ${row.get('totalRevenue', 0):,.0f}; "
-                f"Net Income: ${row.get('netIncome', 0):,.0f}; "
-                f"Total Assets: ${row.get('totalAssets', 0):,.0f}; "
-                f"Operating Cash Flow: ${row.get('operatingCashflow', 0):,.0f}"
-            ),
-        ]
-        prompt = "\n".join(prompt_lines)
-
-        # Derive pseudo ground truth values deterministically
-        pseudo_random_val = hash(company_name + str(row.get("fiscalDateEnding"))) % 9
-        returns_1y, volatility_1y = (
-            ("bad", "high")
-            if pseudo_random_val < 3
-            else ("neutral", "medium")
-            if pseudo_random_val < 6
-            else ("good", "low")
-        )
-        returns_5y, volatility_5y = (
-            ("bad", "high")
-            if (pseudo_random_val + 3) % 9 < 4
-            else ("good", "medium")
-        )
-
-        processed_rows.append(
-            {
-                "prompt": prompt,
-                "is_grpo_task": True,
-                "ground_truth_returns_1y": returns_1y,
-                "ground_truth_volatility_1y": volatility_1y,
-                "ground_truth_returns_5y": returns_5y,
-                "ground_truth_volatility_5y": volatility_5y,
-            }
-        )
-
-    return pd.DataFrame(processed_rows)
-
-
-def load_financial_dataset(split: str = "train", test_size: float = 0.2, k_folds: int = 1, fold_index: int = 0):
-    """Load the financial statements dataset, generate GRPO style tasks and return a HuggingFace Dataset."""
-    print("--- Loading Financial Statement Components ---")
-    dataframes = {}
-    for name, file_path in FINANCIAL_FILES.items():
-        print(f"Loading {name} ({file_path})...")
-        ds = load_dataset(FINANCIAL_REPO, data_files=file_path, split="train")
-        dataframes[name] = ds.to_pandas()
-
-    print("\n--- Processing Datasets ---")
-    grpo_task_df = _process_financial_statements(dataframes)
-
-    # Convert to HuggingFace Dataset and shuffle
-    final_dataset = Dataset.from_pandas(grpo_task_df).shuffle(seed=42)
-    print(f"--- Dataset ready. Total examples: {len(final_dataset)} ---")
-
-    # Handle train test split or k fold cross validation
+    # 4. Classic train/test split or K-fold CV
     if k_folds > 1:
-        print(f"Creating {k_folds} fold cross validation splits. Using fold {fold_index}")
-        kf = KFold(n_splits=k_folds, shuffle=True, random_state=42)
-        all_splits = list(kf.split(final_dataset))
-        train_idxs, test_idxs = all_splits[fold_index]
-        train_dataset = final_dataset.select(train_idxs)
-        test_dataset = final_dataset.select(test_idxs)
-        return train_dataset if split == "train" else test_dataset
-    else:
-        split_dataset = final_dataset.train_test_split(test_size=test_size, seed=42)
-        return split_dataset[split]
+        kf = KFold(n_splits=k_folds, shuffle=True, random_state=seed)
+        train_idx, test_idx = list(kf.split(ds))[fold_index]
+        train_ds = ds.select(train_idx)
+        test_ds  = ds.select(test_idx)
+        return train_ds if split == "train" else test_ds
 
-
-# Verification block
-if __name__ == "__main__":
-    print("Running data loader directly for verification...")
-    train_dataset = load_financial_dataset(split="train")
-
-    print("\n--- Verification Complete ---")
-    print(f"Successfully loaded and processed {len(train_dataset)} examples into the training set.")
-
-    # Display counts and example prompts
-    grpo_count = len([item for item in train_dataset if item["is_grpo_task"]])
-    print(f"GRPO style tasks in training set: {grpo_count}")
-
-    example = train_dataset[0]
-    print("\n--- Example Prompt ---")
-    print(example["prompt"][:600] + "...")
-    print("Ground Truth Returns One Year:", example["ground_truth_returns_1y"])
+    split_ds = ds.train_test_split(test_size=test_size, seed=seed)
+    return split_ds[split]

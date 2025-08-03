@@ -1,92 +1,100 @@
+# ───────────────────────────────────────────────────────────────────────────────
+#  src/reward.py            complete module with two separate reward functions
+# ───────────────────────────────────────────────────────────────────────────────
+"""
+Reward functions for the RiskClassifier task.
+
+There are two independent rewards:
+
+1. risk_format_reward_function
+   • +1 if the completion contains a valid <risk_level> tag whose value is
+     one of the four accepted bands.
+   • -1 otherwise.
+
+2. risk_correctness_reward_function
+   • +1   exact band match
+   • +0.1 adjacent band ("near miss")
+   • -1   band two or more steps away
+   • -2   missing tag or invalid value
+"""
+
+from __future__ import annotations
 import re
-from typing import List, Dict
+from typing import List
 
-# ---------- Ordered bands for "near-miss" scoring ----------
-ORDERED_BANDS = {
-    "returns":    ["bad", "neutral", "good"],
-    "volatility": ["low", "medium", "high"],
-}
+# ---------------------------------------------------------------------------
+#  Ordered bands (for both rewards)
+# ---------------------------------------------------------------------------
+ORDERED_BANDS = ["low risk", "moderate risk", "high risk", "very high risk"]
 
-# ---------- XML helper ----------
-def _parse_prediction(completion: str, tag: str) -> str | None:
+# ---------------------------------------------------------------------------
+#  Regex helpers
+# ---------------------------------------------------------------------------
+TAG_PATTERN = re.compile(
+    r"<risk_level>(.*?)</risk_level>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+def _parse_prediction(completion: str) -> str | None:
     """
-    Extracts <tag>value</tag> from the model's XML-like output.
-    Returns the value in lowercase, or None if the tag is missing.
+    Returns the text between <risk_level> and </risk_level>, stripped and
+    converted to lower case. If the tag is not found, returns None.
     """
-    pattern = f"<{tag}>(.*?)</{tag}>"
-    match = re.search(pattern, completion, re.DOTALL | re.IGNORECASE)
-    return match.group(1).strip().lower() if match else None
+    m = TAG_PATTERN.search(completion)
+    return m.group(1).strip().lower() if m else None
 
-# ---------- Scoring helper ----------
-def _calculate_score(predicted: str | None,
-                     actual: str,
-                     band_type: str) -> float:
-    """
-    Reward schedule:
-      • +1   exact match
-      • +0.1 one-step "near miss"
-      • −1   wrong band
-      • −2   missing / hallucinated value
-    """
-    if predicted is None or actual is None:
-        return -2.0
-
-    if predicted not in ORDERED_BANDS[band_type]:
-        return -2.0
-
-    if predicted == actual:
-        return 1.0
-
-    try:
-        p_idx = ORDERED_BANDS[band_type].index(predicted)
-        a_idx = ORDERED_BANDS[band_type].index(actual)
-        if abs(p_idx - a_idx) == 1:
-            return 0.1
-    except ValueError:
-        return -2.0  # safety net
-
-    return -1.0
-
-# ---------- Main reward function ----------
-def financial_reward_function(
+# ---------------------------------------------------------------------------
+#  Format reward
+# ---------------------------------------------------------------------------
+def risk_format_reward_function(
     *,
     prompts: List[str],
     completions: List[str],
-    ground_truth_returns_1y: List[str],
-    ground_truth_volatility_1y: List[str],
-    ground_truth_returns_5y: List[str],
-    ground_truth_volatility_5y: List[str],
     **kwargs,
 ) -> List[float]:
     """
-    Computes a scalar reward for each (prompt, completion) pair.
-
-    The trainer passes every dataset column as **kwargs**; we declare the ones
-    we need explicitly for clarity and IDE autocompletion.
+    +1 if a valid risk_level tag with an accepted band exists, else -1.
     """
-    batch_rewards: List[float] = []
+    rewards: List[float] = []
+    for comp in completions:
+        pred = _parse_prediction(comp)
+        if pred in ORDERED_BANDS:
+            rewards.append(0.1)
+        else:
+            rewards.append(-0.1)
+    return rewards
 
-    for i, completion in enumerate(completions):
-        # 1. Parse predictions from the generated text
-        pred_ret_1y   = _parse_prediction(completion, "returns_1y")
-        pred_vol_1y   = _parse_prediction(completion, "volatility_1y")
-        pred_ret_5y   = _parse_prediction(completion, "returns_5y")
-        pred_vol_5y   = _parse_prediction(completion, "volatility_5y")
+# ---------------------------------------------------------------------------
+#  Correctness helpers
+# ---------------------------------------------------------------------------
+def _band_distance(predicted: str, actual: str) -> int:
+    """Absolute index distance between predicted and actual band."""
+    return abs(ORDERED_BANDS.index(predicted) - ORDERED_BANDS.index(actual))
 
-        # 2. Compare with ground truth for this sample
-        score_ret_1y = _calculate_score(pred_ret_1y,
-                                        ground_truth_returns_1y[i], "returns")
-        score_vol_1y = _calculate_score(pred_vol_1y,
-                                        ground_truth_volatility_1y[i], "volatility")
-        score_ret_5y = _calculate_score(pred_ret_5y,
-                                        ground_truth_returns_5y[i], "returns")
-        score_vol_5y = _calculate_score(pred_vol_5y,
-                                        ground_truth_volatility_5y[i], "volatility")
+def _calculate_correctness_score(predicted: str | None, actual: str) -> float:
+    if predicted is None or predicted not in ORDERED_BANDS:
+        return -2.0
+    if predicted == actual:
+        return 1.0
+    if _band_distance(predicted, actual) == 1:
+        return 0.1
+    return -1.0
 
-        # 3. Aggregate
-        total_reward = (
-            score_ret_1y + score_vol_1y + score_ret_5y + score_vol_5y
-        )
-        batch_rewards.append(total_reward)
-
-    return batch_rewards
+# ---------------------------------------------------------------------------
+#  Correctness reward
+# ---------------------------------------------------------------------------
+def risk_correctness_reward_function(
+    *,
+    prompts: List[str],
+    completions: List[str],
+    ground_truth_risk_band: List[str],
+    **kwargs,
+) -> List[float]:
+    """
+    Computes correctness reward for each completion.
+    """
+    rewards: List[float] = []
+    for comp, truth in zip(completions, ground_truth_risk_band):
+        pred = _parse_prediction(comp)
+        rewards.append(_calculate_correctness_score(pred, truth))
+    return rewards

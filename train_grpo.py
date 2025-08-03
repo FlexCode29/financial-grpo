@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# train_grpo.py  – LoRA policy · remote-vLLM sampler · ROCm
-
+# train_grpo.py  –  LoRA policy · remote-vLLM sampler · ROCm
 ###############################################################################
 #                         Critical environment flags                          #
 ###############################################################################
@@ -28,8 +27,11 @@ from unsloth import FastLanguageModel
 from trl import GRPOTrainer, GRPOConfig
 
 # project-specific
-from src.data_loader import load_financial_dataset
-from src.reward      import financial_reward_function
+from src.data_loader import load_risk_dataset
+from src.reward      import (
+    risk_format_reward_function,
+    risk_correctness_reward_function,
+)
 from src.callbacks   import PeriodicEvalCallback
 
 ###############################################################################
@@ -80,24 +82,18 @@ patch_adapter_methods()
 ###############################################################################
 #                           Static system prompt                              #
 ###############################################################################
-FINANCIAL_SYSTEM_PROMPT = """You are an expert financial analyst AI. Your task is to predict future stock performance based on 20 years of financial data.
-Respond in XML format, giving reasoning first.
+RISK_SYSTEM_PROMPT = """You are a risk assessment AI.
+Respond in XML format, giving your chain-of-thought reasoning first.
 YOU MUST ALWAYS RETURN A VALID XML DOCUMENT.
-The XML document must contain the following elements:
-<returns_1y> - predicted returns for the next year, one of: [bad, neutral, good]
-<volatility_1y> - predicted volatility for the next year, one of: [low, medium, high]
-<returns_5y> - predicted returns for the next five years, one of: [bad, neutral, good]
-<volatility_5y> - predicted volatility for the next five years, one of: [low, medium, high]
+The XML must contain exactly one element inside <answer>:
+<risk_level>  one of: [low risk, moderate risk, high risk, very high risk]
 
-This is the overall structure of your response:
+Example:
 <reasoning>
 [Your analysis]
 </reasoning>
 <answer>
-<returns_1y>[bad/neutral/good]</returns_1y>
-<volatility_1y>[low/medium/high]</volatility_1y>
-<returns_5y>[bad/neutral/good]</returns_5y>
-<volatility_5y>[low/medium/high]</volatility_5y>
+<risk_level>[low risk|moderate risk|high risk|very high risk]</risk_level>
 </answer>"""
 
 ###############################################################################
@@ -119,9 +115,11 @@ def truncate(text, tok, max_len):
 
 def format_prompts(batch, tok, max_len):
     outs = []
-    for txt, is_rl in zip(batch["prompt"], batch["is_grpo_task"]):
-        msgs = [{"role": "system", "content": FINANCIAL_SYSTEM_PROMPT},
-                {"role": "user",   "content": txt}] if is_rl else [{"role": "user", "content": txt}]
+    for txt in batch["prompt"]:
+        msgs = [
+            {"role": "system", "content": RISK_SYSTEM_PROMPT},
+            {"role": "user",   "content": txt},
+        ]
         outs.append(truncate(build_chat(msgs, tok, True), tok, max_len))
     return {"prompt": outs}
 
@@ -153,17 +151,7 @@ def attach_remote_generate(model, tok, url, max_new):
         resp = requests.post(url, json=payload, timeout=600)
         resp.raise_for_status()
         data = resp.json()
-
-        # vLLM returns either "completion_ids" or OpenAI-style "outputs"
-        comp_ids = data.get("completion_ids") \
-                   or [o["token_ids"] for o in data["outputs"]]
-
-        # --- NEW: pretty-print the decoded completions ----------------------
-        #for i, ids in enumerate(comp_ids):
-        #    text = tok.decode(ids, skip_special_tokens=False)
-        #    print(f"[vLLM completion {i}] {text[300:]}")   # last 300 chars
-        # --------------------------------------------------------------------
-
+        comp_ids = data.get("completion_ids") or [o["token_ids"] for o in data["outputs"]]
         if not comp_ids:
             comp_ids = [[tok.eos_token_id]]
         tensors = [torch.tensor(seq or [tok.eos_token_id],
@@ -225,10 +213,22 @@ def main(args):
     attach_remote_generate(model, tok, args.vllm_remote_url, args.max_completion_length)
 
     # -------- Data --------
-    train_ds = load_financial_dataset(split="train", test_size=args.test_split_size,
-                                      k_folds=args.k_folds, fold_index=args.fold_index)
-    eval_ds  = load_financial_dataset(split="test",  test_size=args.test_split_size,
-                                      k_folds=args.k_folds, fold_index=args.fold_index)
+    train_ds = load_risk_dataset(split="train",
+                                 test_size=args.test_split_size,
+                                 k_folds=args.k_folds,
+                                 fold_index=args.fold_index)
+    eval_ds  = load_risk_dataset(split="test",
+                                 test_size=args.test_split_size,
+                                 k_folds=args.k_folds,
+                                 fold_index=args.fold_index)
+
+    # Make the column expected by PeriodicEvalCallback
+    if "is_grpo_task" not in train_ds.column_names:
+        train_ds = train_ds.add_column("is_grpo_task", [True] * len(train_ds))
+    if "is_grpo_task" not in eval_ds.column_names:
+        eval_ds  = eval_ds.add_column("is_grpo_task",  [True] * len(eval_ds))
+
+    # Format chat prompts
     train_ds = train_ds.map(lambda b: format_prompts(b, tok, args.max_prompt_length),
                             batched=True)
 
@@ -259,9 +259,13 @@ def main(args):
         model=model,
         args=training_args,
         train_dataset=train_ds,
-        reward_funcs=[financial_reward_function],
+        reward_funcs=[
+            risk_format_reward_function,
+            risk_correctness_reward_function,
+        ],
         tokenizer=tok,
-        callbacks=[PeriodicEvalCallback(tokenizer=tok, eval_dataset=eval_ds,
+        callbacks=[PeriodicEvalCallback(tokenizer=tok,
+                                        eval_dataset=eval_ds,
                                         eval_steps=args.eval_steps)],
     )
 
@@ -279,7 +283,7 @@ if __name__ == "__main__":
     DEFAULTS = dict(
         model_name="meta-llama/meta-Llama-3.1-8B-Instruct",
         output_dir="outputs_8b_grpo",
-        max_seq_length=2048+512,
+        max_seq_length=2048 + 512,
         max_prompt_length=2048,
         max_completion_length=512,
     )
@@ -288,17 +292,17 @@ if __name__ == "__main__":
     parser.add_argument("--model_name", default=DEFAULTS["model_name"])
     parser.add_argument("--output_dir", default=DEFAULTS["output_dir"])
     parser.add_argument("--max_seq_length", type=int, default=DEFAULTS["max_seq_length"])
-    parser.add_argument("--lora_rank",  type=int, default=32)
-    parser.add_argument("--num_generations", type=int, default=7)  # must divide dp_size
+    parser.add_argument("--lora_rank", type=int, default=32)
+    parser.add_argument("--num_generations", type=int, default=7)   # must divide dp_size
     parser.add_argument("--max_prompt_length", type=int, default=DEFAULTS["max_prompt_length"])
     parser.add_argument("--max_completion_length", type=int, default=DEFAULTS["max_completion_length"])
     parser.add_argument("--per_device_train_batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--learning_rate", type=float, default=1e-5)
-    parser.add_argument("--warmup_steps",  type=int, default=50)
-    parser.add_argument("--max_steps",     type=int, default=1000)
-    parser.add_argument("--save_steps",    type=int, default=100)
-    parser.add_argument("--eval_steps",    type=int, default=200)
+    parser.add_argument("--warmup_steps",  type=int, default=5)
+    parser.add_argument("--max_steps",     type=int, default=300)
+    parser.add_argument("--save_steps",    type=int, default=50)
+    parser.add_argument("--eval_steps",    type=int, default=5000)
     parser.add_argument("--report_to", choices=["wandb","none"], default="none")
     parser.add_argument("--wandb_project", default="unsloth_grpo")
     parser.add_argument("--test_split_size", type=float, default=0.2)
