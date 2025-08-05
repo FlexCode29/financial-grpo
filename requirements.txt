@@ -1,6 +1,6 @@
 # unsloth[rocm]>=2024.6
 peft>=0.11.1
-transformers>=4.41.2
+transformers>=4.41.2,<4.54.0
 accelerate>=0.31.0
 datasets>=2.18.0
 
