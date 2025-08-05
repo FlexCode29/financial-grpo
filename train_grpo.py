@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#!/usr/bin/env python3
 # train_grpo.py  –  LoRA policy · remote-vLLM sampler · ROCm
 ###############################################################################
 #                         Critical environment flags                          #
@@ -27,11 +28,8 @@ from unsloth import FastLanguageModel
 from trl import GRPOTrainer, GRPOConfig
 
 # project-specific
-from src.data_loader import load_risk_dataset
-from src.reward      import (
-    risk_format_reward_function,
-    risk_correctness_reward_function,
-)
+from src.data_loader import get_gsm8k_questions
+from src.reward import correctness_reward_func, strict_format_reward_func
 from src.callbacks   import PeriodicEvalCallback
 
 ###############################################################################
@@ -213,24 +211,12 @@ def main(args):
     attach_remote_generate(model, tok, args.vllm_remote_url, args.max_completion_length)
 
     # -------- Data --------
-    train_ds = load_risk_dataset(split="train",
-                                 test_size=args.test_split_size,
-                                 k_folds=args.k_folds,
-                                 fold_index=args.fold_index)
-    eval_ds  = load_risk_dataset(split="test",
-                                 test_size=args.test_split_size,
-                                 k_folds=args.k_folds,
-                                 fold_index=args.fold_index)
+    train_ds = get_gsm8k_questions(split="train")
+    eval_ds  = get_gsm8k_questions(split="test")
 
-    # Make the column expected by PeriodicEvalCallback
-    if "is_grpo_task" not in train_ds.column_names:
-        train_ds = train_ds.add_column("is_grpo_task", [True] * len(train_ds))
-    if "is_grpo_task" not in eval_ds.column_names:
-        eval_ds  = eval_ds.add_column("is_grpo_task",  [True] * len(eval_ds))
+    # No need for is_grpo_task column in GSM8K
 
-    # Format chat prompts
-    train_ds = train_ds.map(lambda b: format_prompts(b, tok, args.max_prompt_length),
-                            batched=True)
+    # Prompts are already formatted in get_gsm8k_questions
 
     # -------- Trainer --------
     training_args = GRPOConfig(
@@ -260,8 +246,8 @@ def main(args):
         args=training_args,
         train_dataset=train_ds,
         reward_funcs=[
-            risk_format_reward_function,
-            risk_correctness_reward_function,
+            strict_format_reward_func,
+            correctness_reward_func,
         ],
         tokenizer=tok,
         callbacks=[PeriodicEvalCallback(tokenizer=tok,
