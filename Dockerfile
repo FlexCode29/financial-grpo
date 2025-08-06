@@ -36,7 +36,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 RUN pip install deepspeed==0.16.4
 
-RUN pip install trl==0.21.0  --no-dependencies
+RUN pip install trl==0.16.1  --no-dependencies
 
 COPY . .
 
