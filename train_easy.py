@@ -21,7 +21,6 @@ model_id = "meta-llama/Llama-3.1-8B"
 
 model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        
     )
 
 tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -43,11 +42,17 @@ model = get_peft_model(model, lora_config)
 training_args = GRPOConfig(
     output_dir=OUTPUT_DIR,
     beta=0.04,
+    bf16=True,
     save_strategy="steps",
     save_steps=100,
+    use_vllm=True,
     logging_steps=10,
     save_total_limit=2,
     report_to="wandb",
+    num_generations=7,
+    max_completion_length=64,
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=1,
 )
 
 trainer = GRPOTrainer(

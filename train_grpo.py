@@ -19,6 +19,8 @@ os.environ["TORCH_DISTRIBUTED_USE_FUNCTIONAL"]    = "0"
 ###############################################################################
 #                                   Imports                                   #
 ###############################################################################
+import re
+
 import argparse, inspect, types, requests, torch
 from contextlib import contextmanager, nullcontext
 import torch.nn.utils.rnn as rnn_utils

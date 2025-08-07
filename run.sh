@@ -55,7 +55,7 @@ case "$ROLE" in
 
   train)
     echo ">>> Starting GRPO training on GPU(s): $GPU_LIST"
-    HIP_VISIBLE_DEVICES=$GPU_LIST CUDA_VISIBLE_DEVICES=$GPU_LIST accelerate launch --multi_gpu --num-processes=7 train_grpo.py --model_name "$MODEL_NAME" --report_to wandb
+    HIP_VISIBLE_DEVICES=$GPU_LIST CUDA_VISIBLE_DEVICES=$GPU_LIST accelerate launch --multi_gpu --num-processes=7 train_easy.py
     ;;
 
   help | *)
