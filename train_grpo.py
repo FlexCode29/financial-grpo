@@ -28,9 +28,14 @@ from unsloth import FastLanguageModel
 from trl import GRPOTrainer, GRPOConfig
 
 # project-specific
-from src.data_loader import get_gsm8k_questions
-from src.reward import correctness_reward_func, strict_format_reward_func
-from src.callbacks   import PeriodicEvalCallback
+from datasets import load_dataset
+
+# Use TLDR dataset as in train_easy.py
+train_ds = load_dataset("trl-lib/tldr", split="train")
+
+# Simple reward: length close to 20 chars
+def reward_len(completions, **kwargs):
+    return [-abs(20 - len(c)) for c in completions]
 
 ###############################################################################
 #      PEFT rename + safe disable_adapter wrapper for newer HF versions       #
@@ -211,12 +216,8 @@ def main(args):
     attach_remote_generate(model, tok, args.vllm_remote_url, args.max_completion_length)
 
     # -------- Data --------
-    train_ds = get_gsm8k_questions(split="train")
-    eval_ds  = get_gsm8k_questions(split="test")
-
-    # No need for is_grpo_task column in GSM8K
-
-    # Prompts are already formatted in get_gsm8k_questions
+    # Use TLDR dataset for training, no eval set
+    eval_ds = None
 
     # -------- Trainer --------
     training_args = GRPOConfig(
@@ -245,19 +246,46 @@ def main(args):
         model=model,
         args=training_args,
         train_dataset=train_ds,
-        reward_funcs=[
-            strict_format_reward_func,
-            correctness_reward_func,
-        ],
+        reward_funcs=reward_len,
         tokenizer=tok,
-        callbacks=[PeriodicEvalCallback(tokenizer=tok,
-                                        eval_dataset=eval_ds,
-                                        eval_steps=args.eval_steps)],
+        callbacks=[],
     )
 
-    if accelerator.is_main_process:
-        print("Starting GRPO training")
-    trainer.train()
+    # Absolute path inside the container that you already bind-mount
+    OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/app/outputs/Llama-3.1-8B")
+
+    # Resume from the latest checkpoint in OUTPUT_DIR if present
+    def _latest_checkpoint(base_dir: str):
+        if not os.path.isdir(base_dir):
+            return None
+        candidates = []
+        for name in os.listdir(base_dir):
+            m = re.match(r"checkpoint-(\d+)$", name)
+            if m:
+                path = os.path.join(base_dir, name)
+                if os.path.isdir(path):
+                    candidates.append((int(m.group(1)), path))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda x: x[0])[1]
+
+    resume_path = _latest_checkpoint(OUTPUT_DIR)
+    if resume_path:
+        print(f"Resuming training from: {resume_path}")
+        trainer.train(resume_from_checkpoint=resume_path)
+
+        if accelerator.is_main_process:
+            print("Starting GRPO training")
+        trainer.train(resume_from_checkpoint=resume_path)
+    else:
+        print("No checkpoint found. Starting fresh training run.")
+
+        if accelerator.is_main_process:
+            print("Starting GRPO training")
+        trainer.train()
+
+
+    
     if accelerator.is_main_process:
         print("Training finished, saving adapter")
     trainer.save_model()
@@ -269,9 +297,9 @@ if __name__ == "__main__":
     DEFAULTS = dict(
         model_name="meta-llama/meta-Llama-3.1-8B-Instruct",
         output_dir="outputs_8b_grpo",
-        max_seq_length=2048 + 512,
+        max_seq_length=2048 + 64,
         max_prompt_length=2048,
-        max_completion_length=512,
+        max_completion_length=64,
     )
 
     parser = argparse.ArgumentParser()
@@ -289,7 +317,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_steps",     type=int, default=300)
     parser.add_argument("--save_steps",    type=int, default=50)
     parser.add_argument("--eval_steps",    type=int, default=5000)
-    parser.add_argument("--report_to", choices=["wandb","none"], default="none")
+    parser.add_argument("--report_to", choices=["wandb","none"], default="wandb")
     parser.add_argument("--wandb_project", default="unsloth_grpo")
     parser.add_argument("--test_split_size", type=float, default=0.2)
     parser.add_argument("--k_folds", type=int, default=1)
